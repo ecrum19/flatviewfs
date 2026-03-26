@@ -81,6 +81,7 @@ fn materializes_vcf_small_example() {
         r#"
         CREATE TABLE variants AS
         SELECT
+            CAST(1 AS BIGINT) AS record_id,
             '1' AS chrom,
             CAST(42 AS BIGINT)  AS pos,
             'rs1' AS id,
@@ -88,14 +89,46 @@ fn materializes_vcf_small_example() {
             'C' AS alt_text,
             '50' AS qual_text,
             'PASS' AS filter_text,
-            'DP=10' AS info_text,
-            'GT' AS format_text,
-            '0/1' AS sample_text,
-            7 AS sample_id;
+            7 AS sample_id,
+            CAST(1 AS BIGINT) AS format_signature_id,
+            CAST(1 AS BIGINT) AS info_signature_id;
         "#,
     )
     .unwrap();
     make_parquet(&conn, "SELECT * FROM variants", &data_path);
+
+    let pkg_dir = tmp.path().join("pkg");
+    std::fs::create_dir_all(&pkg_dir).unwrap();
+    std::fs::write(
+        pkg_dir.join("format_signatures.tsv"),
+        "vcf_file_id\tformat_signature_id\tformat_string\tfield_count\tgenotype_file\tgenotype_parquet_path\n1\t1\tGT\t1\tgenotype_sig_1.tsv\tgenotype_sig_1.parquet\n",
+    )
+    .unwrap();
+    std::fs::write(
+        pkg_dir.join("format_signature_fields.tsv"),
+        "vcf_file_id\tformat_signature_id\tfield_index\tformat_header_definition_id\tfield_name\tsource_column\tnumber\tvalue_type\n1\t1\t1\t1\tGT\tgt\t1\tString\n",
+    )
+    .unwrap();
+    std::fs::write(
+        pkg_dir.join("genotype_sig_1.tsv"),
+        "vcf_file_id\trecord_id\tsample_id\tgt\n1\t1\t7\t0/1\n",
+    )
+    .unwrap();
+    std::fs::write(
+        pkg_dir.join("info_signatures.tsv"),
+        "vcf_file_id\tinfo_signature_id\tinfo_string\tfield_count\tinfo_file\tinfo_parquet_path\n1\t1\tDP\t1\tinfo_sig_1.tsv\tinfo_sig_1.parquet\n",
+    )
+    .unwrap();
+    std::fs::write(
+        pkg_dir.join("info_signature_fields.tsv"),
+        "vcf_file_id\tinfo_signature_id\tfield_index\theader_definition_id\tinfo_key\tsource_column\tnumber\tvalue_type\tis_flag\n1\t1\t1\t1\tDP\tdp\t1\tInteger\t0\n",
+    )
+    .unwrap();
+    std::fs::write(
+        pkg_dir.join("info_sig_1.tsv"),
+        "vcf_file_id\trecord_id\tdp\n1\t1\t10\n",
+    )
+    .unwrap();
 
     let manifest = Manifest {
         routes: vec![RouteSpec {
@@ -103,7 +136,10 @@ fn materializes_vcf_small_example() {
             source_glob: format!("{}/{{sample}}.parquet", tmp.path().display()),
             formatter: FormatterKind::Vcf,
             header_sql: None,
-            row_sql: "SELECT chrom, pos, id, ref, alt_text AS alt, qual_text AS qual, filter_text AS filter, info_text AS info, format_text AS fmt, sample_text AS sample_value FROM __PARQUET_SCAN__ WHERE sample_id = {sample} ORDER BY pos".into(),
+            row_sql: format!(
+                "SELECT record_id, chrom, pos, id, ref, alt_text, qual_text AS qual, filter_text, format_signature_id, info_signature_id, CAST(sample_id AS BIGINT) AS sample_id, 'SAMPLE' AS sample_name, '{}' AS package_dir FROM __PARQUET_SCAN__ WHERE sample_id = {{sample}} ORDER BY pos",
+                pkg_dir.display()
+            ),
         }],
     };
 

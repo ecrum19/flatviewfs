@@ -11,6 +11,14 @@ use glob::glob;
 
 use crate::manifest::{Manifest, RouteSpec};
 
+#[derive(Debug)]
+pub struct PreparedSql {
+    /// The SQL string with parameters replaced by positional placeholders.
+    pub sql: String,
+    /// Values bound to each placeholder in order of appearance.
+    pub params: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct CompiledManifest {
     pub routes: Vec<CompiledRoute>,
@@ -89,8 +97,8 @@ impl CompiledRoute {
         &self,
         template: &str,
         params: &BTreeMap<String, String>,
-    ) -> Result<String> {
-        render_template(template, params, true)
+    ) -> Result<PreparedSql> {
+        render_template_prepared(template, params)
     }
 
     pub fn literal_dirs(&self) -> Vec<String> {
@@ -261,6 +269,30 @@ fn render_template(
     }
 
     Ok(out)
+}
+
+fn render_template_prepared(
+    template: &str,
+    params: &BTreeMap<String, String>,
+) -> Result<PreparedSql> {
+    let parts = parse_template(template)?;
+    let mut sql = String::new();
+    let mut args = Vec::new();
+
+    for part in parts {
+        match part {
+            TemplatePart::Lit(x) => sql.push_str(&x),
+            TemplatePart::Var(name) => {
+                let value = params
+                    .get(&name)
+                    .ok_or_else(|| anyhow!("missing template variable {name}"))?;
+                sql.push('?');
+                args.push(value.clone());
+            }
+        }
+    }
+
+    Ok(PreparedSql { sql, params: args })
 }
 
 pub fn path_parent(path: &str) -> &str {

@@ -1,0 +1,51 @@
+[[routes]]
+path = "/vcf/{package}/{sample}.vcf"
+source_glob = "vcf/generated/{package}/parquet/records.parquet"
+formatter = "vcf"
+
+# Pull original header lines from the canonical package.
+header_sql = """
+SELECT raw_line
+FROM read_csv_auto({__package_dir} || '/header_lines.tsv', delim='\t', header=true)
+ORDER BY header_index
+"""
+
+# Flatten canonical package into the fields expected by the VCF formatter.
+row_sql = """
+WITH pkg AS (SELECT {__package_dir} AS package_dir),
+records AS (
+    SELECT * FROM read_parquet({__package_dir} || '/parquet/records.parquet')
+),
+alts AS (
+    SELECT record_id, string_agg(alt_value, ',' ORDER BY alt_index) AS alt_text
+    FROM read_parquet({__package_dir} || '/parquet/record_alt.parquet')
+    GROUP BY record_id
+),
+filters AS (
+    SELECT record_id, string_agg(filter_value, ';' ORDER BY filter_index) AS filter_text
+    FROM read_csv_auto({__package_dir} || '/record_filter.tsv', delim='\t', header=true)
+    GROUP BY record_id
+),
+samples AS (
+    SELECT sample_id, sample_name FROM read_csv_auto({__package_dir} || '/samples.tsv', delim='\t', header=true)
+)
+SELECT
+  r.record_id,
+  r.chrom,
+  r.pos,
+  coalesce(r.record_name, '.') AS id,
+  r.ref,
+  coalesce(a.alt_text, '.') AS alt_text,
+  coalesce(cast(r.qual AS VARCHAR), '.') AS qual,
+  coalesce(f.filter_text, case r.filter_state when 'PASS' then 'PASS' else '.' end) AS filter_text,
+  r.format_signature_id,
+  r.info_signature_id,
+  s.sample_id,
+  s.sample_name,
+  (SELECT package_dir FROM pkg) AS package_dir
+FROM records r
+LEFT JOIN alts a USING(record_id)
+LEFT JOIN filters f USING(record_id)
+JOIN samples s ON s.sample_name = {sample}
+ORDER BY r.chrom, r.pos, r.ref
+"""

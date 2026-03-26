@@ -1,42 +1,34 @@
 # flatviewfs
 
-Phase-1 proof-of-concept / MVP for exposing a query + transformation over Parquet on disk as a plain text file in FUSE, using DuckDB under the hood.
+Mount query results as read-only files via FUSE, materializing on demand with DuckDB.
 
-What is included:
+## What works now
 
-- static manifest-driven routes
-- one route pattern example: `/samples/{sample}.vcf`
-- DuckDB-backed materialization into a local spool file
-- shared cache per snapshot key
-- blocking reads for incomplete materializations
-- a VCF formatter skeleton
+- Canonical VCF packages produced by `vcf/canonical_tsv.py` can be reconstructed back into VCF text through a manifest plus the VCF formatter.
+- CSV formatter for simple tabular outputs.
+- Prepared-statement binding for user parameters to avoid SQL injection of scalars.
 
-Notes:
+## Usage sketch
 
-- This is a skeleton, not a finished production crate.
-- The code is structured to make the FUSE adapter, materializer, and formatter easy to iterate on.
+1) Generate canonical packages (Parquet/TSV) from VCFs:
 
-## Layout
+   ```bash
+   python vcf/canonical_tsv.py split vcf/tests/test-files/0GOOR_HG002_subset.vcf vcf/generated
+   ```
+2) Point the manifest at the generated package, e.g. `examples/vcf-canonical.toml`.
+3) Mount:
 
-- `examples/vcf-manifest.toml`: example route manifest
-- `src/main.rs`: mount entrypoint
-- `src/fs.rs`: FUSE filesystem
-- `src/materialize.rs`: worker pool and job dispatch
-- `src/duckdb_runner.rs`: DuckDB query execution
-- `src/cache.rs`: spool-file backed shared cache
-- `src/formatters/vcf.rs`: VCF text formatter
-- `src/route.rs`: route compilation and path matching
+   ```bash
+   cargo run -- --manifest examples/vcf-canonical.toml --mountpoint /tmp/flatviewfs --cache-dir /var/tmp/flatviewfs
+   ```
+   Access files like `/tmp/flatviewfs/vcf/0GOOR_HG002_subset/HG002_PacBio_Clc_OTS_PASS_Hg38_no_alt.vcf`.
 
-## Next steps
+## Testing
+- `cargo test -- --nocapture` runs:
+  - CSV materialization smoke test.
+  - VCF materialization smoke test (synthetic mini package).
+  - Canonical end-to-end reconstruction test against the generated package for `0GOOR_HG002_subset`.
 
-1. Replace string-substituted scalar SQL injection with prepared statements.
-2. Persist cache metadata and chunk index across restarts.
-3. Improve directory enumeration for dynamic paths.
-4. Add integration tests and compile-fix against the exact `fuser` and `duckdb` versions you choose.
-5. Add BGZF + tabix sidecar support for genomic region-aware workflows.
-
-## Tiny smoke tests
-
-- `cargo test materialize -- --nocapture` runs two integration tests:
-  - `materializes_csv_small_example` materializes a two-row table to CSV output (example data in `examples/data/tiny.csv`).
-  - `materializes_vcf_small_example` materializes a single-record VCF file end-to-end via DuckDB + formatter.
+## Notes
+- DuckDB table functions require literal file paths; manifests substitute package paths as literals while user inputs are parameter-bound.
+- INFO/FORMAT reconstruction depends on the canonical TSV schema emitted by `canonical_tsv.py`; schema changes will require manifest/formatter updates.
