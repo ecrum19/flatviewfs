@@ -1,0 +1,16 @@
+##fileformat=VCFv4.2
+##fileDate=20200615
+##fileEncoding=US-ASCII
+##fileOrigin=/tmp_location/until_2020_06_01/amhein/PrecisionFDAMay2020/ForSubmission_final/PacBioFiltering_BasicIndelFilt_StrongHompolInsFilt_MinFreq15_PASS/HG002_PacBio_Clc_OTS_PASS_Hg38_no_alt
+##source=CLC Genomics Grid Worker 20.9.9 Beta 1 build 209900
+##reference=/CLC_References/homo_sapiens/sequence/hg38_no_alt_analysis_set/Homo_sapiens_sequence_hg38_no_alt_analysis_set
+##contig=<ID=1,length=248956422>
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
+##FORMAT=<ID=DP,Number=1,Type=Integer,Description="Total number of filtered reads used to call variants at this position in this sample.">
+##FORMAT=<ID=CLCAD2,Number=R,Type=Integer,Description="Allele depth, number of filtered reads supporting the alleles, ordered as listed in REF and ALT.">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	HG002_PacBio_Clc_OTS_PASS_Hg38_no_alt
+1	10013	.	T	G	20.39	.	.	GT:CLCAD2:DP	0/1:3,2:6
+1	10108	.	C	CT	24.42	.	.	GT:CLCAD2:DP	0/1:3,4:8
+1	10177	.	A	C	44.73	.	.	GT:CLCAD2:DP	0/1:5,2:8
+1	10177	.	A	AC	103.81	.	.	GT:CLCAD2:DP	0/1:4,4:8
+1	29137	.	CG	C,CC	90.12	.	.	GT:CLCAD2:DP	1/2:0,16,15:39
