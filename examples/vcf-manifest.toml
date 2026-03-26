@@ -1,0 +1,27 @@
+[[routes]]
+path = "/samples/{sample}.vcf"
+source_glob = "/data/genomics/sample={sample}/**/*.parquet"
+formatter = "vcf"
+
+header_sql = """
+SELECT '##source=flatviewfs'
+UNION ALL
+SELECT '##contig=<ID=1>'
+"""
+
+row_sql = """
+SELECT
+  chrom,
+  pos,
+  coalesce(id, '.')          AS id,
+  ref,
+  alt_text                   AS alt,
+  coalesce(qual_text, '.')   AS qual,
+  coalesce(filter_text, '.') AS filter,
+  coalesce(info_text, '.')   AS info,
+  coalesce(format_text, '.') AS fmt,
+  coalesce(sample_text, '.') AS sample_value
+FROM __PARQUET_SCAN__
+WHERE sample_id = {sample}
+ORDER BY chrom, pos, ref, alt_text
+"""

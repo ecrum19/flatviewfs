@@ -7,6 +7,7 @@
 A canonical, round-trip-safe TSV export that treats the VCF as a normalized relational package rather than a single flattened table. The export preserves enough structure to reconstruct a standards-compliant VCF exactly in field meaning and record/sample ordering, while also loading efficiently into DuckDB.
 
 Chosen defaults:
+
 - Optimize for round-trip fidelity first, DuckDB second.
 - Represent genotype/sample data with one TSV per unique ordered `FORMAT` signature.
 - Keep a canonical normalized output; optional convenience views/tables can be derived later, not treated as source-of-truth.
