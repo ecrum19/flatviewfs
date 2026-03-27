@@ -2,9 +2,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
 use duckdb::arrow::{
-    array::Array,
-    record_batch::RecordBatch,
-    util::display::array_value_to_string,
+    array::Array, record_batch::RecordBatch, util::display::array_value_to_string,
 };
 
 use crate::{cache::CacheEntry, formatters::Formatter};
@@ -31,12 +29,9 @@ impl Formatter for CsvFormatter {
     }
 
     fn write_batch(&self, batch: &RecordBatch, entry: &CacheEntry) -> Result<()> {
+        let mut buffer = String::new();
         // Emit header once when the first batch arrives.
-        if self.write_header_row
-            && !self
-                .header_written
-                .swap(true, Ordering::SeqCst)
-        {
+        if self.write_header_row && !self.header_written.swap(true, Ordering::SeqCst) {
             let header = batch
                 .schema()
                 .fields()
@@ -45,8 +40,8 @@ impl Formatter for CsvFormatter {
                 .map(csv_escape)
                 .collect::<Vec<_>>()
                 .join(",");
-            entry.append(header.as_bytes())?;
-            entry.append(b"\n")?;
+            buffer.push_str(&header);
+            buffer.push('\n');
         }
 
         for row in 0..batch.num_rows() {
@@ -60,10 +55,13 @@ impl Formatter for CsvFormatter {
                 }
             }
             let line = cells.join(",");
-            entry.append(line.as_bytes())?;
-            entry.append(b"\n")?;
+            buffer.push_str(&line);
+            buffer.push('\n');
         }
 
+        if !buffer.is_empty() {
+            entry.append(buffer.as_bytes())?;
+        }
         Ok(())
     }
 }

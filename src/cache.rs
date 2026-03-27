@@ -1,12 +1,13 @@
 use std::{
     collections::HashMap,
     fs::{self, File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
+    io::Write,
+    os::unix::fs::FileExt,
     path::{Path, PathBuf},
     sync::Arc,
 };
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use parking_lot::{Condvar, Mutex};
 
 #[derive(Debug)]
@@ -42,7 +43,10 @@ impl CacheManager {
 
     pub fn get_or_create(&self, key: &str) -> Result<(Arc<CacheEntry>, bool)> {
         if let Some(entry) = self.entries.lock().get(key).cloned() {
-            return Ok((entry, false));
+            if !entry.is_failed() {
+                return Ok((entry, false));
+            }
+            self.entries.lock().remove(key);
         }
 
         let data_path = self.root.join(format!("{key}.data"));
@@ -71,14 +75,24 @@ impl CacheManager {
     pub fn get(&self, key: &str) -> Option<Arc<CacheEntry>> {
         self.entries.lock().get(key).cloned()
     }
+
+    pub fn drop_entry(&self, key: &str) {
+        self.entries.lock().remove(key);
+    }
 }
 
 impl CacheEntry {
+    pub fn is_failed(&self) -> bool {
+        self.progress.lock().failed.is_some()
+    }
+
     pub fn append(&self, bytes: &[u8]) -> Result<()> {
+        if self.is_failed() {
+            return Err(anyhow!("entry canceled or failed"));
+        }
         {
             let mut file = self.writer.lock();
             file.write_all(bytes)?;
-            file.flush()?;
         }
 
         let mut p = self.progress.lock();
@@ -100,6 +114,16 @@ impl CacheEntry {
         self.cv.notify_all();
     }
 
+    pub fn cancel(&self, reason: &str) {
+        let mut p = self.progress.lock();
+        if p.eof {
+            return;
+        }
+        p.failed = Some(reason.to_string());
+        p.eof = true;
+        self.cv.notify_all();
+    }
+
     pub fn size_hint(&self) -> u64 {
         self.progress.lock().produced
     }
@@ -109,7 +133,7 @@ impl CacheEntry {
         p.eof && p.failed.is_none()
     }
 
-    pub fn read_blocking(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
+    pub fn read_blocking_at(&self, reader: &File, offset: u64, len: usize) -> Result<Vec<u8>> {
         loop {
             let mut p = self.progress.lock();
 
@@ -122,10 +146,15 @@ impl CacheEntry {
                 let n = available.min(len);
                 drop(p);
 
-                let mut f = File::open(&self.data_path)?;
-                f.seek(SeekFrom::Start(offset))?;
                 let mut buf = vec![0; n];
-                f.read_exact(&mut buf)?;
+                let mut read = 0;
+                while read < n {
+                    let nread = reader.read_at(&mut buf[read..], offset + read as u64)?;
+                    if nread == 0 {
+                        return Err(anyhow!("unexpected EOF at offset {}", offset + read as u64));
+                    }
+                    read += nread;
+                }
                 return Ok(buf);
             }
 
@@ -135,5 +164,10 @@ impl CacheEntry {
 
             self.cv.wait(&mut p);
         }
+    }
+
+    pub fn read_blocking(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
+        let reader = File::open(&self.data_path)?;
+        self.read_blocking_at(&reader, offset, len)
     }
 }

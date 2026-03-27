@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
-use duckdb::{Connection, params_from_iter};
+use duckdb::{params_from_iter, Connection};
 
 use crate::{
-    formatters::{Formatter, csv::CsvFormatter, vcf::VcfFormatter},
+    formatters::{csv::CsvFormatter, vcf::VcfFormatter, Formatter},
     manifest::FormatterKind,
     materialize::MaterializeJob,
     route::PreparedSql,
@@ -71,13 +71,29 @@ pub fn run_job(conn: &Connection, job: MaterializeJob) -> Result<()> {
     formatter.write_header(&job.entry)?;
 
     let rendered = render_prepared(&job.route.spec.row_sql, &job, &scan_sql)?;
+    let row_sql = rendered
+        .sql
+        .trim_end_matches(|c: char| c == ';' || c.is_whitespace());
+    let schema_sql = format!("SELECT * FROM ({row_sql}) LIMIT 0");
+    let schema = {
+        let mut stmt = conn.prepare(&schema_sql)?;
+        let arrow = stmt.query_arrow(params_from_iter(rendered.params.iter()))?;
+        arrow.get_schema()
+    };
 
-    let mut stmt = conn.prepare(&rendered.sql).context("prepare row_sql")?;
-    let batches = stmt
-        .query_arrow(params_from_iter(rendered.params.iter()))
+    if job.entry.is_failed() {
+        return Ok(());
+    }
+
+    let mut stmt = conn.prepare(row_sql).context("prepare row_sql")?;
+    let mut stream = stmt
+        .stream_arrow(params_from_iter(rendered.params.iter()), schema)
         .context("execute row_sql")?;
 
-    for batch in batches {
+    for batch in &mut stream {
+        if job.entry.is_failed() {
+            break;
+        }
         formatter.write_batch(&batch, &job.entry)?;
     }
 

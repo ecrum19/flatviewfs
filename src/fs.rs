@@ -1,16 +1,18 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     ffi::OsStr,
+    fs::File,
     path::Path,
     sync::{
-        Arc,
         atomic::{AtomicU64, Ordering},
+        Arc,
     },
     time::{Duration, SystemTime},
 };
 
 use anyhow::Result;
 use fuser::{
+    consts::{FOPEN_DIRECT_IO, FOPEN_KEEP_CACHE},
     FileAttr, FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
     ReplyOpen, Request,
 };
@@ -20,7 +22,7 @@ use crate::{
     cache::{CacheEntry, CacheManager},
     manifest::Manifest,
     materialize::{MaterializeJob, MaterializerPool},
-    route::{CompiledManifest, path_parent},
+    route::{path_parent, CompiledManifest},
 };
 
 const TTL: Duration = Duration::from_secs(1);
@@ -28,7 +30,9 @@ const ROOT_INO: u64 = 1;
 
 #[derive(Debug, Clone)]
 enum Node {
-    Dir { path: String },
+    Dir {
+        path: String,
+    },
     File {
         path: String,
         route_index: usize,
@@ -43,9 +47,9 @@ struct FsIndex {
     next_ino: u64,
 }
 
-#[derive(Clone)]
 struct OpenHandle {
     entry: Arc<CacheEntry>,
+    reader: File,
 }
 
 pub struct ParqFs {
@@ -53,7 +57,7 @@ pub struct ParqFs {
     cache: CacheManager,
     materializers: MaterializerPool,
     index: RwLock<FsIndex>,
-    open_handles: RwLock<HashMap<u64, OpenHandle>>,
+    open_handles: RwLock<HashMap<u64, Arc<OpenHandle>>>,
     next_fh: AtomicU64,
 }
 
@@ -205,13 +209,8 @@ impl Filesystem for ParqFs {
             format!("{}/{}", parent_path, name.to_string_lossy())
         };
 
-        let ino = self
-            .index
-            .read()
-            .by_path
-            .get(&full_path)
-            .copied()
-            .or_else(|| self.ensure_file_node(&full_path));
+        let existing = { self.index.read().by_path.get(&full_path).copied() };
+        let ino = existing.or_else(|| self.ensure_file_node(&full_path));
 
         let Some(ino) = ino else {
             reply.error(libc::ENOENT);
@@ -302,11 +301,26 @@ impl Filesystem for ParqFs {
         match self.open_virtual_file(route_index, &params) {
             Ok(entry) => {
                 let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
-                self.open_handles
-                    .write()
-                    .insert(fh, OpenHandle { entry: entry.clone() });
+                let reader = match File::open(&entry.data_path) {
+                    Ok(f) => f,
+                    Err(err) => {
+                        tracing::error!("open reader failed: {err:#}");
+                        reply.error(libc::EIO);
+                        return;
+                    }
+                };
+                let handle = Arc::new(OpenHandle {
+                    entry: entry.clone(),
+                    reader,
+                });
+                self.open_handles.write().insert(fh, handle);
 
-                reply.opened(fh, 0);
+                let flags = if entry.is_complete() {
+                    FOPEN_KEEP_CACHE
+                } else {
+                    FOPEN_DIRECT_IO
+                };
+                reply.opened(fh, flags);
             }
             Err(err) => {
                 tracing::error!("open failed: {err:#}");
@@ -331,7 +345,10 @@ impl Filesystem for ParqFs {
             return;
         };
 
-        match handle.entry.read_blocking(offset as u64, size as usize) {
+        match handle
+            .entry
+            .read_blocking_at(&handle.reader, offset as u64, size as usize)
+        {
             Ok(bytes) => reply.data(&bytes),
             Err(err) => {
                 tracing::error!("read failed: {err:#}");
@@ -350,7 +367,21 @@ impl Filesystem for ParqFs {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        self.open_handles.write().remove(&fh);
+        let handle = self.open_handles.write().remove(&fh);
+        if let Some(handle) = handle {
+            let still_open = self
+                .open_handles
+                .read()
+                .values()
+                .any(|h| h.entry.key == handle.entry.key);
+            let cancel_disabled = std::env::var("FLATVIEWFS_DISABLE_CANCEL").is_ok();
+            if !still_open && !handle.entry.is_complete() && !cancel_disabled {
+                handle
+                    .entry
+                    .cancel("materialization canceled because last handle closed");
+                self.cache.drop_entry(&handle.entry.key);
+            }
+        }
         reply.ok();
     }
 }

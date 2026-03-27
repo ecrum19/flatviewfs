@@ -5,7 +5,7 @@ use std::{
     time::UNIX_EPOCH,
 };
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use blake3::Hasher;
 use glob::glob;
 
@@ -57,19 +57,19 @@ impl CompiledManifest {
             routes.push(compiled);
         }
 
-        Ok(Self { routes, static_dirs })
+        Ok(Self {
+            routes,
+            static_dirs,
+        })
     }
 
     pub fn match_path(&self, path: &str) -> Option<MatchedRoute> {
-        self.routes
-            .iter()
-            .enumerate()
-            .find_map(|(i, r)| {
-                r.match_path(path).map(|params| MatchedRoute {
-                    route_index: i,
-                    params,
-                })
+        self.routes.iter().enumerate().find_map(|(i, r)| {
+            r.match_path(path).map(|params| MatchedRoute {
+                route_index: i,
+                params,
             })
+        })
     }
 }
 

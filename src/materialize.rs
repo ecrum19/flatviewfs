@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc, thread};
 
 use anyhow::Result;
-use crossbeam_channel::{Receiver, Sender, unbounded};
+use crossbeam_channel::{unbounded, Receiver, Sender};
 use duckdb::Connection;
 
 use crate::{cache::CacheEntry, duckdb_runner::run_job, route::CompiledRoute};

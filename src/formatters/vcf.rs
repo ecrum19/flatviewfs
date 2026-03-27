@@ -1,6 +1,10 @@
-use std::{collections::HashMap, path::Path, sync::Mutex};
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::{Arc, Mutex},
+};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use duckdb::arrow::{
     array::{Array, Int64Array, StringArray},
     record_batch::RecordBatch,
@@ -21,7 +25,7 @@ use crate::{cache::CacheEntry, formatters::Formatter};
 pub struct VcfFormatter {
     pub extra_header_lines: Vec<String>,
     pub sample_name: String,
-    meta_cache: Mutex<HashMap<String, PackageMeta>>,
+    meta_cache: Mutex<HashMap<String, Arc<PackageMeta>>>,
 }
 
 impl VcfFormatter {
@@ -45,10 +49,12 @@ impl Formatter for VcfFormatter {
             return Ok(());
         }
 
+        let mut buf = String::new();
         for line in &self.extra_header_lines {
-            entry.append(line.as_bytes())?;
-            entry.append(b"\n")?;
+            buf.push_str(line);
+            buf.push('\n');
         }
+        entry.append(buf.as_bytes())?;
         Ok(())
     }
 
@@ -65,25 +71,25 @@ impl Formatter for VcfFormatter {
         let format_sig = int_col(batch, "format_signature_id")?;
         let info_sig = int_col(batch, "info_signature_id")?;
         let package_dir = str_col(batch, "package_dir")?;
+        let mut batch_meta: HashMap<String, Arc<PackageMeta>> = HashMap::new();
+        let mut buffer = String::new();
 
         for row in 0..batch.num_rows() {
             let package_dir = val_str(package_dir, row, "");
-            let meta = self.load_meta(package_dir)?;
+            let meta = if let Some(meta) = batch_meta.get(package_dir) {
+                meta
+            } else {
+                let loaded = self.load_meta(package_dir)?;
+                batch_meta.insert(package_dir.to_string(), loaded.clone());
+                batch_meta.get(package_dir).expect("inserted")
+            };
             let format_signature_id = val_i64(format_sig, row, 0);
             let info_signature_id = val_i64(info_sig, row, 0);
             let record_id = val_i64(record_id, row, 0);
             let sample_id = val_i64(sample_id, row, 0);
-            let info_text = render_info(
-                info_signature_id,
-                record_id,
-                &meta,
-            )?;
-            let (format_text, sample_text) = render_genotype(
-                format_signature_id,
-                record_id,
-                sample_id,
-                &meta,
-            )?;
+            let info_text = render_info(info_signature_id, record_id, &meta)?;
+            let (format_text, sample_text) =
+                render_genotype(format_signature_id, record_id, sample_id, &meta)?;
 
             let line = format!(
                 "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
@@ -98,9 +104,12 @@ impl Formatter for VcfFormatter {
                 format_text,
                 sample_text,
             );
-            entry.append(line.as_bytes())?;
+            buffer.push_str(&line);
         }
 
+        if !buffer.is_empty() {
+            entry.append(buffer.as_bytes())?;
+        }
         Ok(())
     }
 }
@@ -149,13 +158,33 @@ struct InfoSignatureRow {
     info_file: String,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug)]
 struct PackageMeta {
+    base: std::path::PathBuf,
     format_fields: HashMap<i64, Vec<FormatField>>,
     format_strings: HashMap<i64, String>,
     info_fields: HashMap<i64, Vec<InfoField>>,
-    info_rows: HashMap<i64, HashMap<String, String>>,
-    genotype_rows: HashMap<(i64, i64), HashMap<String, String>>,
+    info_files: HashMap<i64, String>,
+    genotype_files: HashMap<i64, String>,
+    info_rows: Mutex<HashMap<i64, HashMap<i64, HashMap<String, String>>>>,
+    genotype_rows: Mutex<HashMap<i64, HashMap<i64, HashMap<String, String>>>>,
+    sample_id: Mutex<Option<i64>>,
+}
+
+impl Default for PackageMeta {
+    fn default() -> Self {
+        Self {
+            base: std::path::PathBuf::new(),
+            format_fields: HashMap::new(),
+            format_strings: HashMap::new(),
+            info_fields: HashMap::new(),
+            info_files: HashMap::new(),
+            genotype_files: HashMap::new(),
+            info_rows: Mutex::new(HashMap::new()),
+            genotype_rows: Mutex::new(HashMap::new()),
+            sample_id: Mutex::new(None),
+        }
+    }
 }
 
 fn parse_tsv<T: for<'a> Deserialize<'a>>(path: &Path) -> Result<Vec<T>> {
@@ -200,7 +229,7 @@ fn read_rows(path: &Path) -> Result<Vec<HashMap<String, String>>> {
 }
 
 impl VcfFormatter {
-    fn load_meta(&self, package_dir: &str) -> Result<PackageMeta> {
+    fn load_meta(&self, package_dir: &str) -> Result<Arc<PackageMeta>> {
         {
             if let Some(cached) = self.meta_cache.lock().unwrap().get(package_dir) {
                 return Ok(cached.clone());
@@ -209,12 +238,15 @@ impl VcfFormatter {
 
         let base = Path::new(package_dir);
         let mut meta = PackageMeta::default();
+        meta.base = base.to_path_buf();
 
         let format_signatures: Vec<FormatSignature> =
             parse_tsv(&base.join("format_signatures.tsv"))?;
         for sig in &format_signatures {
             meta.format_strings
                 .insert(sig.signature_id, sig.format_string.clone());
+            meta.genotype_files
+                .insert(sig.signature_id, sig.genotype_file.clone());
         }
 
         let mut fields: Vec<FormatField> = parse_tsv(&base.join("format_signature_fields.tsv"))?;
@@ -229,59 +261,24 @@ impl VcfFormatter {
         let mut info_fields: Vec<InfoField> = parse_tsv(&base.join("info_signature_fields.tsv"))?;
         info_fields.sort_by_key(|f| (f.signature_id, f.index));
         for f in info_fields {
-            meta.info_fields
-                .entry(f.signature_id)
-                .or_default()
-                .push(f);
+            meta.info_fields.entry(f.signature_id).or_default().push(f);
         }
 
-        // Load info rows keyed by record_id.
-        let info_sigs: Vec<InfoSignatureRow> =
-            parse_tsv(&base.join("info_signatures.tsv"))?;
+        let info_sigs: Vec<InfoSignatureRow> = parse_tsv(&base.join("info_signatures.tsv"))?;
         for sig in info_sigs {
-            let path = base.join(sig.info_file);
-            let rows = read_rows(&path)?;
-            for mut row in rows {
-                let record_id = row
-                    .remove("record_id")
-                    .and_then(|s| s.parse::<i64>().ok())
-                    .unwrap_or_default();
-                row.remove("vcf_file_id");
-                meta.info_rows.insert(record_id, row);
-            }
+            meta.info_files.insert(sig._signature_id, sig.info_file);
         }
 
-        // Load genotype rows keyed by (record_id, sample_id).
-        for sig in format_signatures {
-            let path = base.join(sig.genotype_file);
-            let rows = read_rows(&path)?;
-            for mut row in rows {
-                let record_id = row
-                    .remove("record_id")
-                    .and_then(|s| s.parse::<i64>().ok())
-                    .unwrap_or_default();
-                let sample_id = row
-                    .remove("sample_id")
-                    .and_then(|s| s.parse::<i64>().ok())
-                    .unwrap_or_default();
-                row.remove("vcf_file_id");
-                meta.genotype_rows.insert((record_id, sample_id), row);
-            }
-        }
-
+        let arc = Arc::new(meta);
         self.meta_cache
             .lock()
             .unwrap()
-            .insert(package_dir.to_string(), meta.clone());
-        Ok(meta)
+            .insert(package_dir.to_string(), arc.clone());
+        Ok(arc)
     }
 }
 
-fn render_info(
-    sig_id: i64,
-    record_id: i64,
-    meta: &PackageMeta,
-) -> Result<String> {
+fn render_info(sig_id: i64, record_id: i64, meta: &PackageMeta) -> Result<String> {
     if sig_id == 0 {
         return Ok(".".to_string());
     }
@@ -289,10 +286,30 @@ fn render_info(
         Some(f) if !f.is_empty() => f,
         _ => return Ok(".".to_string()),
     };
-    let data = meta.info_rows.get(&record_id);
+    let data = {
+        let mut cache = meta.info_rows.lock().unwrap();
+        if !cache.contains_key(&sig_id) {
+            if let Some(file) = meta.info_files.get(&sig_id) {
+                let path = meta.base.join(file);
+                let rows = read_rows(&path)?;
+                let mut by_record = HashMap::new();
+                for mut row in rows {
+                    let record_id = row
+                        .remove("record_id")
+                        .and_then(|s| s.parse::<i64>().ok())
+                        .unwrap_or_default();
+                    row.remove("vcf_file_id");
+                    by_record.insert(record_id, row);
+                }
+                cache.insert(sig_id, by_record);
+            }
+        }
+        cache.get(&sig_id).and_then(|m| m.get(&record_id).cloned())
+    };
+    let data_ref = data.as_ref();
     let mut parts = Vec::new();
     for field in fields {
-        let val = data.and_then(|m| m.get(&field.source));
+        let val = data_ref.and_then(|m| m.get(&field.source));
         if field.is_flag != 0 && matches!(val, Some(v) if v != "0" && !v.is_empty() && v != ".") {
             parts.push(field.name.clone());
         } else if let Some(rendered) = val {
@@ -321,15 +338,51 @@ fn render_genotype(
         Some(f) if !f.is_empty() => f,
         _ => return Ok((".".to_string(), ".".to_string())),
     };
-    let empty = HashMap::new();
-    let data = meta
-        .genotype_rows
-        .get(&(record_id, sample_id))
-        .unwrap_or(&empty);
+    {
+        let mut cached_sample = meta.sample_id.lock().unwrap();
+        if let Some(existing) = *cached_sample {
+            if existing != sample_id {
+                return Err(anyhow!(
+                    "sample_id changed within file: saw {existing} then {sample_id}"
+                ));
+            }
+        } else {
+            *cached_sample = Some(sample_id);
+        }
+    }
+
+    let data = {
+        let mut cache = meta.genotype_rows.lock().unwrap();
+        if !cache.contains_key(&sig_id) {
+            if let Some(file) = meta.genotype_files.get(&sig_id) {
+                let path = meta.base.join(file);
+                let rows = read_rows(&path)?;
+                let mut by_record = HashMap::new();
+                for mut row in rows {
+                    let rid = row
+                        .remove("record_id")
+                        .and_then(|s| s.parse::<i64>().ok())
+                        .unwrap_or_default();
+                    let sid = row
+                        .remove("sample_id")
+                        .and_then(|s| s.parse::<i64>().ok())
+                        .unwrap_or_default();
+                    if sid != sample_id {
+                        continue;
+                    }
+                    row.remove("vcf_file_id");
+                    by_record.insert(rid, row);
+                }
+                cache.insert(sig_id, by_record);
+            }
+        }
+        cache.get(&sig_id).and_then(|m| m.get(&record_id).cloned())
+    };
+    let data_ref = data.as_ref();
 
     let mut values = Vec::new();
     for field in fields {
-        let val = data.get(&field.source);
+        let val = data_ref.and_then(|row| row.get(&field.source));
         values.push(
             val.map(|s| s.as_str())
                 .filter(|s| !s.is_empty())
@@ -342,7 +395,13 @@ fn render_genotype(
         .format_strings
         .get(&sig_id)
         .cloned()
-        .unwrap_or_else(|| fields.iter().map(|f| f.name.clone()).collect::<Vec<_>>().join(":"));
+        .unwrap_or_else(|| {
+            fields
+                .iter()
+                .map(|f| f.name.clone())
+                .collect::<Vec<_>>()
+                .join(":")
+        });
 
     let sample_text = values.join(":");
     Ok((format_text, sample_text))

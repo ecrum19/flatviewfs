@@ -2,8 +2,8 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::Parser;
-use fuser::MountOption;
 use flatviewfs::{fs::ParqFs, manifest::Manifest};
+use fuser::MountOption;
 
 #[derive(Debug, Parser)]
 struct Args {
