@@ -1,6 +1,19 @@
 [[routes]]
 path = "/vcf-{package}-{sample}.vcf"
+package_root = "vcf/generated_full/{package}"
 source_glob = "vcf/generated_full/{package}/parquet/records.parquet"
+extra_inputs = [
+  "{package_root}/header_lines.tsv",
+  "{package_root}/record_filter.tsv",
+  "{package_root}/samples.tsv",
+  "{package_root}/format_signatures.tsv",
+  "{package_root}/format_signature_fields.tsv",
+  "{package_root}/info_signatures.tsv",
+  "{package_root}/info_signature_fields.tsv",
+  "{package_root}/info_sig_*.tsv",
+  "{package_root}/genotype_sig_*.tsv",
+  "{package_root}/parquet/record_alt.parquet",
+]
 formatter = "vcf"
 
 # Pull original header lines from the canonical package.

@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
     time::UNIX_EPOCH,
 };
 
@@ -29,6 +30,8 @@ pub struct CompiledManifest {
 pub struct CompiledRoute {
     pub spec: RouteSpec,
     parts: Vec<TemplatePart>,
+    source_parts: Vec<TemplatePart>,
+    discovered_params: Arc<Mutex<Option<Vec<BTreeMap<String, String>>>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -77,7 +80,9 @@ impl CompiledRoute {
     pub fn new(spec: RouteSpec) -> Result<Self> {
         Ok(Self {
             parts: parse_template(&spec.path)?,
+            source_parts: parse_template(&spec.source_glob)?,
             spec,
+            discovered_params: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -90,7 +95,7 @@ impl CompiledRoute {
         template: &str,
         params: &BTreeMap<String, String>,
     ) -> Result<String> {
-        render_template(template, params, false)
+        render_template(template, &self.augment_params(params), false)
     }
 
     pub fn render_sql_template(
@@ -98,7 +103,7 @@ impl CompiledRoute {
         template: &str,
         params: &BTreeMap<String, String>,
     ) -> Result<PreparedSql> {
-        render_template_prepared(template, params)
+        render_template_prepared(template, &self.augment_params(params))
     }
 
     pub fn literal_dirs(&self) -> Vec<String> {
@@ -125,6 +130,16 @@ impl CompiledRoute {
             let path = entry?;
             if path.is_file() {
                 files.push(path);
+            }
+        }
+
+        for extra in &self.spec.extra_inputs {
+            let pat = self.render_path_template(extra, params)?;
+            for entry in glob(&pat).with_context(|| format!("bad glob pattern: {pat}"))? {
+                let path = entry?;
+                if path.is_file() {
+                    files.push(path);
+                }
             }
         }
 
@@ -165,6 +180,73 @@ impl CompiledRoute {
         }
 
         Ok(hasher.finalize().to_hex().to_string())
+    }
+
+    pub fn package_root(&self, params: &BTreeMap<String, String>) -> Option<String> {
+        self.spec
+            .package_root
+            .as_ref()
+            .and_then(|r| self.render_path_template(r, params).ok())
+    }
+
+    fn augment_params(&self, params: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+        let mut out = params.clone();
+        if let Some(root) = self
+            .spec
+            .package_root
+            .as_ref()
+            .and_then(|r| render_template(r, params, false).ok())
+        {
+            out.insert("package_root".to_string(), root);
+        }
+        out
+    }
+
+    fn glob_pattern(&self, template: &str) -> String {
+        template
+            .chars()
+            .scan(false, |in_brace, ch| {
+                if ch == '{' {
+                    *in_brace = true;
+                    return Some('*');
+                }
+                if ch == '}' {
+                    *in_brace = false;
+                    return Some('\0');
+                }
+                if *in_brace {
+                    Some('\0')
+                } else {
+                    Some(ch)
+                }
+            })
+            .filter(|c| *c != '\0')
+            .collect()
+    }
+
+    fn match_source_path(&self, path: &Path) -> Option<BTreeMap<String, String>> {
+        match_template(&self.source_parts, &path.to_string_lossy())
+    }
+
+    pub fn discovered_params(&self) -> Result<Vec<BTreeMap<String, String>>> {
+        if let Some(cached) = self.discovered_params.lock().unwrap().clone() {
+            return Ok(cached);
+        }
+        let glob_pat = self.glob_pattern(&self.spec.source_glob);
+        let mut params = Vec::new();
+        for entry in glob(&glob_pat).with_context(|| format!("bad glob pattern: {glob_pat}"))? {
+            let path = entry?;
+            if !path.is_file() {
+                continue;
+            }
+            if let Some(map) = self.match_source_path(&path) {
+                params.push(map);
+            }
+        }
+        params.sort();
+        params.dedup();
+        *self.discovered_params.lock().unwrap() = Some(params.clone());
+        Ok(params)
     }
 }
 

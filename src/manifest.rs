@@ -12,6 +12,9 @@ pub struct Manifest {
 pub struct RouteSpec {
     pub path: String,
     pub source_glob: String,
+    #[serde(default)]
+    pub extra_inputs: Vec<String>,
+    pub package_root: Option<String>,
     pub formatter: FormatterKind,
     pub header_sql: Option<String>,
     pub row_sql: String,

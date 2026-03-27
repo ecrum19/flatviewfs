@@ -19,22 +19,18 @@ pub fn configure_connection(conn: &Connection) -> Result<()> {
 }
 
 fn render_prepared(sql: &str, job: &MaterializeJob, scan_sql: &str) -> Result<PreparedSql> {
-    let params = job.params.clone();
-    let package_dir = job
-        .files
-        .first()
-        .and_then(|f| f.parent())
-        .and_then(|p| p.parent())
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_default();
-
-    let mut template = sql.to_string();
-    if !package_dir.is_empty() {
-        let escaped = package_dir.replace('\'', "''");
+    let mut params = job.params.clone();
+    if let Some(root) = job.route.package_root(&params) {
+        params.insert("package_root".to_string(), root.clone());
+        let escaped = root.replace('\'', "''");
+        let mut template = sql.to_string();
         template = template.replace("{__package_dir}", &format!("'{escaped}'"));
+        let mut rendered = job.route.render_sql_template(&template, &params)?;
+        rendered.sql = rendered.sql.replace("__PARQUET_SCAN__", scan_sql);
+        return Ok(rendered);
     }
 
-    let mut rendered = job.route.render_sql_template(&template, &params)?;
+    let mut rendered = job.route.render_sql_template(sql, &params)?;
     rendered.sql = rendered.sql.replace("__PARQUET_SCAN__", scan_sql);
     Ok(rendered)
 }
@@ -95,6 +91,8 @@ pub fn run_job(conn: &Connection, job: MaterializeJob) -> Result<()> {
             break;
         }
         formatter.write_batch(&batch, &job.entry)?;
+        let produced = job.entry.size_hint();
+        job.entry.wait_for_need(produced)?;
     }
 
     job.entry.finish();

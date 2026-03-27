@@ -27,3 +27,6 @@ example-*/
 
 .DS_Store
 
+
+docs/rustdoc/
+

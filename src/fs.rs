@@ -134,6 +134,109 @@ impl ParqFs {
             .collect()
     }
 
+    fn populate_dynamic(&self, dir_path: &str) {
+        for route in self.routes.routes.iter() {
+            let segs: Vec<_> = route.spec.path.trim_start_matches('/').split('/').collect();
+            let dir_segs: Vec<_> = dir_path.trim_start_matches('/').split('/').collect();
+            if dir_segs.len() > segs.len() {
+                continue;
+            }
+            // literal prefix must match up to dir_segs
+            let mut prefix_ok = true;
+            for (i, dir_seg) in dir_segs.iter().enumerate() {
+                if segs.get(i).map(|s| s.contains('{')).unwrap_or(false) {
+                    prefix_ok = false;
+                    break;
+                }
+                if segs.get(i).map(|s| s.to_string()) != Some(dir_seg.to_string()) {
+                    prefix_ok = false;
+                    break;
+                }
+            }
+            if !prefix_ok {
+                continue;
+            }
+            let next = segs.get(dir_segs.len());
+            if let Some(next_seg) = next {
+                if next_seg.contains('{') {
+                    let var_name = next_seg.trim_matches(|c| c == '{' || c == '}').to_string();
+                    if let Ok(param_sets) = route.discovered_params() {
+                        for params in param_sets {
+                            if let Some(val) = params.get(&var_name) {
+                                let child_name = val.to_string();
+                                let child_path = if dir_path == "/" {
+                                    format!("/{child_name}")
+                                } else {
+                                    format!("{dir_path}/{child_name}")
+                                };
+                                self.ensure_dirs_for_path(&child_path);
+                                let mut idx = self.index.write();
+                                if !idx.by_path.contains_key(&child_path) {
+                                    let ino = idx.next_ino;
+                                    idx.next_ino += 1;
+                                    idx.by_path.insert(child_path.clone(), ino);
+                                    idx.by_ino.insert(
+                                        ino,
+                                        Node::Dir {
+                                            path: child_path.clone(),
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // literal child
+                    let child_path = if dir_path == "/" {
+                        format!("/{next_seg}")
+                    } else {
+                        format!("{dir_path}/{next_seg}")
+                    };
+                    self.ensure_dirs_for_path(&child_path);
+                }
+            } else {
+                // dir_path equals route path, so add files for discovered params.
+                if let Ok(param_sets) = route.discovered_params() {
+                    for params in param_sets {
+                        if let Ok(full_path) = route.render_path_template(&route.spec.path, &params)
+                        {
+                            if route.spec.path.contains('{') {
+                                self.ensure_dirs_for_path(&full_path);
+                            }
+                            self.ensure_file_node(&full_path);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn ensure_dirs_for_path(&self, full_path: &str) {
+        let mut current = String::from("/");
+        let segments: Vec<_> = full_path.trim_start_matches('/').split('/').collect();
+        for seg in segments.iter().take(segments.len().saturating_sub(1)) {
+            if current != "/" {
+                current.push('/');
+            }
+            current.push_str(seg);
+            if !self.index.read().by_path.contains_key(&current) {
+                let mut idx = self.index.write();
+                if idx.by_path.contains_key(&current) {
+                    continue;
+                }
+                let ino = idx.next_ino;
+                idx.next_ino += 1;
+                idx.by_path.insert(current.clone(), ino);
+                idx.by_ino.insert(
+                    ino,
+                    Node::Dir {
+                        path: current.clone(),
+                    },
+                );
+            }
+        }
+    }
+
     fn attr_for(&self, ino: u64, node: &Node) -> FileAttr {
         let now = SystemTime::now();
         let (kind, perm, nlink, size) = match node {
@@ -244,6 +347,8 @@ impl Filesystem for ParqFs {
             reply.error(libc::ENOTDIR);
             return;
         };
+
+        self.populate_dynamic(&path);
 
         let mut entries: Vec<(u64, FileType, String)> = vec![
             (ino, FileType::Directory, ".".into()),

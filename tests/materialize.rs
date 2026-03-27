@@ -41,6 +41,8 @@ fn materializes_csv_small_example() {
         routes: vec![RouteSpec {
             path: "/tables/{table}.csv".into(),
             source_glob: format!("{}/{{table}}.parquet", tmp.path().display()),
+            extra_inputs: vec![],
+            package_root: None,
             formatter: FormatterKind::Csv,
             header_sql: None,
             row_sql: "SELECT id, name FROM __PARQUET_SCAN__ ORDER BY id".into(),
@@ -134,6 +136,8 @@ fn materializes_vcf_small_example() {
         routes: vec![RouteSpec {
             path: "/samples/{sample}.vcf".into(),
             source_glob: format!("{}/{{sample}}.parquet", tmp.path().display()),
+            extra_inputs: vec![],
+            package_root: None,
             formatter: FormatterKind::Vcf,
             header_sql: None,
             row_sql: format!(

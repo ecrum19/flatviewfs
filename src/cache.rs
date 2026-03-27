@@ -4,6 +4,7 @@ use std::{
     io::Write,
     os::unix::fs::FileExt,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     sync::Arc,
 };
 
@@ -23,6 +24,7 @@ pub struct CacheEntry {
     writer: Mutex<File>,
     progress: Mutex<Progress>,
     cv: Condvar,
+    furthest_requested: AtomicU64,
 }
 
 #[derive(Debug, Clone)]
@@ -30,7 +32,12 @@ struct Progress {
     produced: u64,
     eof: bool,
     failed: Option<String>,
+    chunks_ready: Vec<bool>,
 }
+
+pub const CHUNK_SIZE: u64 = 1 << 20; // 1 MiB
+pub const PRODUCER_LEAD_CHUNKS: u64 = 4;
+pub const PRODUCER_LEAD_TIMEOUT_MS: u64 = 200; // allow progress if no readers advance
 
 impl CacheManager {
     pub fn new(root: impl AsRef<Path>) -> Result<Self> {
@@ -64,8 +71,10 @@ impl CacheManager {
                 produced: 0,
                 eof: false,
                 failed: None,
+                chunks_ready: Vec::new(),
             }),
             cv: Condvar::new(),
+            furthest_requested: AtomicU64::new(0),
         });
 
         self.entries.lock().insert(key.to_string(), entry.clone());
@@ -97,6 +106,16 @@ impl CacheEntry {
 
         let mut p = self.progress.lock();
         p.produced += bytes.len() as u64;
+        let needed_chunks = (p.produced + CHUNK_SIZE - 1) / CHUNK_SIZE;
+        if p.chunks_ready.len() < needed_chunks as usize {
+            p.chunks_ready.resize(needed_chunks as usize, false);
+        }
+        for idx in 0..p.chunks_ready.len() {
+            let chunk_end = ((idx as u64 + 1) * CHUNK_SIZE).min(p.produced);
+            if chunk_end >= (idx as u64 + 1) * CHUNK_SIZE {
+                p.chunks_ready[idx] = true;
+            }
+        }
         self.cv.notify_all();
         Ok(())
     }
@@ -104,6 +123,12 @@ impl CacheEntry {
     pub fn finish(&self) {
         let mut p = self.progress.lock();
         p.eof = true;
+        if p.produced > 0 {
+            let needed_chunks = (p.produced + CHUNK_SIZE - 1) / CHUNK_SIZE;
+            if p.chunks_ready.len() < needed_chunks as usize {
+                p.chunks_ready.resize(needed_chunks as usize, true);
+            }
+        }
         self.cv.notify_all();
     }
 
@@ -133,7 +158,57 @@ impl CacheEntry {
         p.eof && p.failed.is_none()
     }
 
+    pub fn request_offset(&self, offset: u64) {
+        loop {
+            let current = self.furthest_requested.load(Ordering::Relaxed);
+            if offset <= current {
+                break;
+            }
+            if self
+                .furthest_requested
+                .compare_exchange(current, offset, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                break;
+            }
+        }
+        self.cv.notify_all();
+    }
+
+    fn chunk_ready(p: &Progress, idx: usize) -> bool {
+        p.chunks_ready.get(idx).copied().unwrap_or(false)
+            || (p.eof && (idx as u64) * CHUNK_SIZE < p.produced)
+    }
+
+    pub fn wait_for_need(&self, produced: u64) -> Result<()> {
+        use std::time::Duration;
+        let mut p = self.progress.lock();
+        loop {
+            if let Some(err) = &p.failed {
+                return Err(anyhow!(err.clone()));
+            }
+            if p.eof {
+                return Ok(());
+            }
+            let furthest = self.furthest_requested.load(Ordering::Relaxed);
+            let target = furthest
+                .saturating_add(PRODUCER_LEAD_CHUNKS.saturating_mul(CHUNK_SIZE))
+                .max(PRODUCER_LEAD_CHUNKS.saturating_mul(CHUNK_SIZE));
+            if produced < target {
+                return Ok(());
+            }
+            let timeout = Duration::from_millis(PRODUCER_LEAD_TIMEOUT_MS);
+            let result = self.cv.wait_for(&mut p, timeout);
+            if result.timed_out() {
+                // No reader advanced within timeout; allow producer to continue.
+                return Ok(());
+            }
+        }
+    }
+
     pub fn read_blocking_at(&self, reader: &File, offset: u64, len: usize) -> Result<Vec<u8>> {
+        self.request_offset(offset + len as u64);
+        let target_chunk = (offset / CHUNK_SIZE) as usize;
         loop {
             let mut p = self.progress.lock();
 
@@ -141,8 +216,8 @@ impl CacheEntry {
                 return Err(anyhow!(err.clone()));
             }
 
-            if offset < p.produced {
-                let available = (p.produced - offset) as usize;
+            if Self::chunk_ready(&p, target_chunk) || offset < p.produced || p.eof {
+                let available = (p.produced.saturating_sub(offset)) as usize;
                 let n = available.min(len);
                 drop(p);
 
