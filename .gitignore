@@ -24,6 +24,7 @@ vcf/test-files/
 __pycache__/
 _vendor/
 example-*/
+generated/
 
 .DS_Store
 
